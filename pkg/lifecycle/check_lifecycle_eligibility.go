@@ -36,10 +36,15 @@ const lifecycleMinOCPVersion = "5.0"
 // format). Returns (false, nil) if the Dockerfile parses successfully but
 // at least one targeted OCP version is below lifecycleMinOCPVersion.
 // Returns (true, nil) if all targeted OCP versions are >= lifecycleMinOCPVersion.
-func CheckLifecycleEligibility(dockerfilePath string) (bool, error) {
-	d, err := dockerfile.Parse(dockerfilePath)
+func CheckLifecycleEligibility(dockerfilePath, buildContextPath string) (bool, error) {
+	resolvedPath, err := resolveDockerfilePath(dockerfilePath, buildContextPath)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse dockerfile %q: %w", dockerfilePath, err)
+		return false, err
+	}
+
+	d, err := dockerfile.Parse(resolvedPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse dockerfile %q: %w", resolvedPath, err)
 	}
 
 	ocpVersions, err := ocp.GetOCPVersionsFromDockerfile(d)
@@ -56,7 +61,7 @@ func CheckLifecycleEligibility(dockerfilePath string) (bool, error) {
 		slog.Info("not all OCP versions >= minimum version, not eligible for lifecycle injection",
 			"min_version", lifecycleMinOCPVersion,
 			"versions", ocpVersions,
-			"dockerfile", dockerfilePath,
+			"dockerfile", resolvedPath,
 		)
 	}
 

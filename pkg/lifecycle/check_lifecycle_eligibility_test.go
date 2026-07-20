@@ -17,6 +17,8 @@ limitations under the License.
 package lifecycle
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -28,7 +30,7 @@ LABEL com.redhat.fbc.openshift.version=["5.0"]
 COPY catalog /configs
 `)
 
-	eligible, err := CheckLifecycleEligibility(dockerfilePath)
+	eligible, err := CheckLifecycleEligibility(dockerfilePath, base)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -45,7 +47,7 @@ LABEL com.redhat.fbc.openshift.version=["4.20"]
 COPY catalog /configs
 `)
 
-	eligible, err := CheckLifecycleEligibility(dockerfilePath)
+	eligible, err := CheckLifecycleEligibility(dockerfilePath, base)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -62,7 +64,7 @@ LABEL com.redhat.fbc.openshift.version=["4.20","5.0"]
 COPY catalog /configs
 `)
 
-	eligible, err := CheckLifecycleEligibility(dockerfilePath)
+	eligible, err := CheckLifecycleEligibility(dockerfilePath, base)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -72,9 +74,32 @@ COPY catalog /configs
 }
 
 func TestCheckLifecycleEligibility_InvalidDockerfile_ReturnsError(t *testing.T) {
-	_, err := CheckLifecycleEligibility("/nonexistent/Dockerfile")
+	_, err := CheckLifecycleEligibility("/nonexistent/Dockerfile", t.TempDir())
 	if err == nil {
 		t.Fatal("expected error for nonexistent Dockerfile, got nil")
+	}
+}
+
+func TestCheckLifecycleEligibility_DockerfileInSubdirectory_ResolvesRelativeToBuildContext(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "v5.0"), 0755); err != nil {
+		t.Fatalf("failed to create subdirectory: %v", err)
+	}
+	dockerfileContent := []byte(`FROM ubuntu
+LABEL com.redhat.fbc.openshift.version=["5.0"]
+COPY catalog /configs
+`)
+	if err := os.WriteFile(filepath.Join(base, "v5.0", "catalog.Dockerfile"), dockerfileContent, 0644); err != nil {
+		t.Fatalf("failed to write dockerfile: %v", err)
+	}
+
+	// dockerfile path is relative to the build context, not the current directory.
+	eligible, err := CheckLifecycleEligibility("catalog.Dockerfile", filepath.Join(base, "v5.0"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !eligible {
+		t.Error("got eligible=false, want true for OCP version 5.0")
 	}
 }
 
@@ -86,7 +111,7 @@ LABEL com.redhat.fbc.openshift.version=[]
 COPY catalog /configs
 `)
 
-	_, err := CheckLifecycleEligibility(dockerfilePath)
+	_, err := CheckLifecycleEligibility(dockerfilePath, base)
 	if err == nil {
 		t.Fatal("expected error for empty label array, got nil")
 	}
@@ -100,7 +125,7 @@ LABEL com.redhat.fbc.openshift.version=["4.20","invalid"]
 COPY catalog /configs
 `)
 
-	_, err := CheckLifecycleEligibility(dockerfilePath)
+	_, err := CheckLifecycleEligibility(dockerfilePath, base)
 	if err == nil {
 		t.Fatal("expected error for invalid OCP version in label, got nil")
 	}

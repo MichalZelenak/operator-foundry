@@ -9,6 +9,12 @@ Go CLI for Konflux operator pipeline tasks
 
 ## `fbc` commands
 
+`--dockerfile` is resolved as given (relative to the current working
+directory, or absolute) if that path exists; otherwise it is resolved
+relative to `--build-context`. This supports Dockerfiles in a subdirectory
+of the build context, e.g. `--dockerfile catalog.Dockerfile --build-context
+v5.0` resolves to `v5.0/catalog.Dockerfile`.
+
 ### `fbc check-lifecycle-eligibility`
 
 Checks whether the File-Based Catalog (FBC) is eligible for lifecycle
@@ -18,6 +24,7 @@ injection, based on whether all OCP versions targeted by the Dockerfile are
 ```bash
 operator-foundry fbc check-lifecycle-eligibility \
   --dockerfile <path-to-Dockerfile> \
+  --build-context <path-to-build-context> \
   [--output <path-to-output-file>]
 ```
 

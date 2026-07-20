@@ -280,6 +280,47 @@ func TestExtractPackageNames_UnreadableCatalogDir_ReturnsError(t *testing.T) {
 	}
 }
 
+// ── ResolveDockerfilePath ───────────────────────────────────────────────────────
+
+func TestResolveDockerfilePath_ExistsAsGiven_ReturnedUnchanged(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "Dockerfile")
+	if err := os.WriteFile(path, []byte("FROM ubuntu"), 0644); err != nil {
+		t.Fatalf("failed to write dockerfile: %v", err)
+	}
+
+	resolved, err := resolveDockerfilePath(path, t.TempDir())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resolved != path {
+		t.Errorf("got %q, want %q", resolved, path)
+	}
+}
+
+func TestResolveDockerfilePath_RelativeToBuildContext_Resolved(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "catalog.Dockerfile"), []byte("FROM ubuntu"), 0644); err != nil {
+		t.Fatalf("failed to write dockerfile: %v", err)
+	}
+
+	resolved, err := resolveDockerfilePath("catalog.Dockerfile", base)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := filepath.Join(base, "catalog.Dockerfile")
+	if resolved != want {
+		t.Errorf("got %q, want %q", resolved, want)
+	}
+}
+
+func TestResolveDockerfilePath_NotFoundEither_ReturnsError(t *testing.T) {
+	_, err := resolveDockerfilePath("nonexistent.Dockerfile", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for nonexistent dockerfile, got nil")
+	}
+}
+
 // ── ResolveAndValidatePath ───────────────────────────────────────────────────────
 
 func TestResolveAndValidatePath_ValidSubPath(t *testing.T) {

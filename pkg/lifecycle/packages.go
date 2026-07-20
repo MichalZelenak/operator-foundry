@@ -119,6 +119,33 @@ func deduplicate(s []string) []string {
 	return result
 }
 
+// resolveDockerfilePath resolves dockerfilePath to an openable path. If it
+// exists as given (relative to the current working directory, or absolute),
+// it is returned unchanged. Otherwise it is resolved relative to
+// buildContextPath, since Konflux build pipelines pass the Dockerfile path
+// relative to the build context (e.g. dockerfile=catalog.Dockerfile,
+// build-context=v5.0 for a Dockerfile at v5.0/catalog.Dockerfile).
+func resolveDockerfilePath(dockerfilePath, buildContextPath string) (string, error) {
+	if _, err := os.Stat(dockerfilePath); err == nil {
+		return dockerfilePath, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("failed to stat dockerfile %q: %w", dockerfilePath, err)
+	}
+
+	joined, err := resolveAndValidatePath(buildContextPath, dockerfilePath)
+	if err != nil {
+		return "", fmt.Errorf("dockerfile %q not found relative to the current directory, and could not resolve relative to build context %q: %w", dockerfilePath, buildContextPath, err)
+	}
+	if _, err := os.Stat(joined); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("dockerfile not found at %q or %q", dockerfilePath, joined)
+		}
+		return "", fmt.Errorf("failed to stat dockerfile %q: %w", joined, err)
+	}
+
+	return joined, nil
+}
+
 // resolveAndValidatePath securely joins subPath to baseContext,
 // returning the symlink-resolved absolute path. Returns an error if subPath is absolute,
 // if the resolved path escapes baseContext via directory traversal, or if the

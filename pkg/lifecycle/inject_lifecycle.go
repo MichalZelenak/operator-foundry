@@ -34,9 +34,14 @@ import (
 //
 // Returns an error if any package fails to inject.
 func InjectLifecycle(dockerfilePath, buildContextPath, lifecycleDir, packages string) error {
-	d, err := dockerfile.Parse(dockerfilePath)
+	resolvedPath, err := resolveDockerfilePath(dockerfilePath, buildContextPath)
 	if err != nil {
-		return fmt.Errorf("failed to parse dockerfile %q: %w", dockerfilePath, err)
+		return err
+	}
+
+	d, err := dockerfile.Parse(resolvedPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse dockerfile %q: %w", resolvedPath, err)
 	}
 
 	entries, err := ParseCopyInstructionsForConfigs(d)

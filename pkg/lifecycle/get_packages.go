@@ -25,9 +25,14 @@ import (
 // GetPackages parses the Dockerfile and extracts OLM package names from its
 // COPY instructions.
 func GetPackages(dockerfilePath, buildContextPath string) ([]string, error) {
-	d, err := dockerfile.Parse(dockerfilePath)
+	resolvedPath, err := resolveDockerfilePath(dockerfilePath, buildContextPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse dockerfile %q: %w", dockerfilePath, err)
+		return nil, err
+	}
+
+	d, err := dockerfile.Parse(resolvedPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse dockerfile %q: %w", resolvedPath, err)
 	}
 
 	entries, err := ParseCopyInstructionsForConfigs(d)

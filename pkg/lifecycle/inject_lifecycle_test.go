@@ -101,6 +101,47 @@ COPY catalog /configs
 	}
 }
 
+func TestInjectLifecycle_DockerfileInSubdirectory_ResolvesRelativeToBuildContext(t *testing.T) {
+	base := t.TempDir()
+	ctx := filepath.Join(base, "v5.0")
+	lifecycleDir := t.TempDir()
+
+	pkgDir := filepath.Join(ctx, "catalog", "my-operator")
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatalf("failed to create package dir: %v", err)
+	}
+
+	dockerfileContent := []byte(`FROM ubuntu
+LABEL com.redhat.fbc.openshift.version=["5.0"]
+COPY catalog /configs
+`)
+	if err := os.WriteFile(filepath.Join(ctx, "catalog.Dockerfile"), dockerfileContent, 0644); err != nil {
+		t.Fatalf("failed to write dockerfile: %v", err)
+	}
+
+	lifecycleData := []byte(`{"schema":"io.openshift.operators.lifecycles.v1alpha1"}`)
+	pkgLifecycleDir := filepath.Join(lifecycleDir, "my-operator")
+	if err := os.MkdirAll(pkgLifecycleDir, 0755); err != nil {
+		t.Fatalf("failed to create lifecycle pkg dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgLifecycleDir, "lifecycle.json"), lifecycleData, 0644); err != nil {
+		t.Fatalf("failed to write lifecycle file: %v", err)
+	}
+
+	// dockerfile path is relative to the build context, not the current directory.
+	if err := InjectLifecycle("catalog.Dockerfile", ctx, lifecycleDir, "my-operator"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(pkgDir, "lifecycle.json"))
+	if err != nil {
+		t.Fatalf("lifecycle.json not injected: %v", err)
+	}
+	if string(got) != string(lifecycleData) {
+		t.Errorf("content mismatch\ngot: %s\nwant: %s", got, lifecycleData)
+	}
+}
+
 func TestInjectLifecycle_MissingLifecycleFile_ReturnsError(t *testing.T) {
 	base := t.TempDir()
 	lifecycleDir := t.TempDir()

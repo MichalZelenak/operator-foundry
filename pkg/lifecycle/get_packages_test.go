@@ -78,6 +78,32 @@ COPY catalog /configs
 	}
 }
 
+func TestGetPackages_DockerfileInSubdirectory_ResolvesRelativeToBuildContext(t *testing.T) {
+	base := t.TempDir()
+	ctx := filepath.Join(base, "v5.0")
+
+	if err := os.MkdirAll(filepath.Join(ctx, "catalog", "my-operator"), 0755); err != nil {
+		t.Fatalf("failed to create package dir: %v", err)
+	}
+
+	dockerfileContent := []byte(`FROM ubuntu
+LABEL com.redhat.fbc.openshift.version=["5.0"]
+COPY catalog /configs
+`)
+	if err := os.WriteFile(filepath.Join(ctx, "catalog.Dockerfile"), dockerfileContent, 0644); err != nil {
+		t.Fatalf("failed to write dockerfile: %v", err)
+	}
+
+	// dockerfile path is relative to the build context, not the current directory.
+	packages, err := GetPackages("catalog.Dockerfile", ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(packages) != 1 || packages[0] != "my-operator" {
+		t.Errorf("got %v, want [my-operator]", packages)
+	}
+}
+
 func TestGetPackages_InvalidDockerfile_ReturnsError(t *testing.T) {
 	_, err := GetPackages("/nonexistent/Dockerfile", t.TempDir())
 	if err == nil {
