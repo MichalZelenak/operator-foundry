@@ -21,16 +21,24 @@ Checks whether the File-Based Catalog (FBC) is eligible for lifecycle
 injection, based on whether all OCP versions targeted by the Dockerfile are
 >= the minimum supported version.
 
+If the base image tag is not a fixed OCP version but references a build ARG
+(e.g. `FROM registry.redhat.io/openshift4/ose-operator-registry-rhel9:${CATALOG_VERSION}`),
+pass its value with `--build-arg` so it resolves to the same tag the image is
+actually built with. If omitted, the ARG's own default value from the
+Dockerfile is used instead.
+
 ```bash
 operator-foundry fbc check-lifecycle-eligibility \
   --dockerfile <path-to-Dockerfile> \
   --build-context <path-to-build-context> \
+  [--build-arg KEY=VALUE]... \
   [--output <path-to-output-file>]
 ```
 
 | Scenario | Behavior |
 |---|---|
 | Dockerfile cannot be parsed | Exits with error |
+| Base image tag references an ARG with no default and no matching `--build-arg` | Exits with error |
 | All targeted OCP versions >= 5.0 | Writes `true`, exit 0 |
 | Not all targeted OCP versions >= 5.0 | Writes `false`, exit 0 |
 
