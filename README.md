@@ -48,10 +48,16 @@ Determines the OLM packages included in a File-Based Catalog (FBC) by parsing
 the `COPY`/`ADD` instructions in the provided Dockerfile and inspecting the
 corresponding catalog subdirectories in the build context.
 
+If a `COPY`/`ADD` source path references a build ARG (e.g. `COPY
+./${INPUT_DIR}/ /configs/my-operator`), pass its value with `--build-arg` so
+it resolves to the same path the image is actually built with. If omitted,
+the ARG's own default value from the Dockerfile is used instead.
+
 ```bash
 operator-foundry fbc get-packages \
   --dockerfile <path-to-Dockerfile> \
   --build-context <path-to-build-context> \
+  [--build-arg KEY=VALUE]... \
   [--output <path-to-output-file>]
 ```
 
@@ -67,12 +73,17 @@ Injects pre-generated `lifecycle.json` files into the catalog source directories
 for the given OLM packages. Does not check lifecycle-injection eligibility —
 callers should run `fbc check-lifecycle-eligibility` first.
 
+If a COPY/ADD source path references a build ARG (e.g. COPY ./${INPUT_DIR}/ /configs/my-operator), pass its value with --build-arg so
+the actual catalog directory on disk can be located. If omitted, the ARG's
+own default value from the Dockerfile is used instead.
+
 ```bash
 operator-foundry fbc inject-lifecycle \
   --dockerfile <path-to-Dockerfile> \
   --build-context <path-to-build-context> \
   --packages <comma-separated-package-names> \
-  --lifecycle-dir <path-to-lifecycle-dir>
+  --lifecycle-dir <path-to-lifecycle-dir> \
+  [--build-arg KEY=VALUE]...
 ```
 
 | Scenario | Behavior |
