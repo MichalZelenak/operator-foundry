@@ -19,28 +19,122 @@ package image
 import (
 	"context"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/konflux-ci/operator-foundry/pkg/ocp"
+	"golang.org/x/sync/errgroup"
 )
 
 // first OCP version that supports OCI MediaType natively
 const ociNativeMinOCPVersion = "4.21"
+const goroutinesLimit = 50
 
-// MediaTypeCheckResult holds the outcome of the MediaType and OCP version compatibility check
-type MediaTypesCheckResult struct {
+// MediaTypeCheckBatchResult holds the outcome of the MediaType and OCP version compatibility check for multiple relatedImages
+type MediaTypeCheckBatchResult struct {
 	Passed               bool
 	WrongMediaTypeImages []string
 	BrokenImages         []string
 }
 
-type MediaTypeCheckResult struct {
+// mediaTypeCheckSingleResult holds the outcome of the MediaType and OCP version compatibility check for one relatedImage
+type mediaTypeCheckSingleResult struct {
 	Passed              bool
 	WrongMediaTypeImage string
 	BrokenImage         string
 }
 
-func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetcher ManifestFetcher, ocpVersion string) MediaTypeCheckResult {
+// CheckRelatedImagesMediaType checks whether all related images
+// are compliant with the constraint that OCI MediaType is not present for OCP < v4.21.
+// If the ocp version is >= v4.21, this check is skipped, otherwise we pull the MediaType,
+// check the values, and if there is DockerManifestList we also check its Image manifests
+//
+// Images are checked concurrently (up to 50 goroutines). Images that fail to fetch
+// are retried once after the first pass completes.
+//
+// Returns (nil, err) if the OCP version is malformed or comparison fails.
+// Returns a MediaTypeCheckBatchResult with Passed=true if all images are compliant or
+// the OCP version >= 4.21. Returns a MediaTypeCheckBatchResult with Passed=false and
+// WrongMediaTypeImages/BrokenImages populated for every non-compliant or unreachable image.
+func CheckRelatedImagesMediaType(
+	ctx context.Context, ocpVersion string, relatedImages []string, fetcher ManifestFetcher,
+) (*MediaTypeCheckBatchResult, error) {
+	// skip the rest of the check if the ocpVersion>=4.21
+	gte, err := ocp.OCPVersionGTE(ocpVersion, ociNativeMinOCPVersion)
+	if err != nil {
+		return nil, err
+	}
+	if gte {
+		slog.Info("ocp version supports OCI media types natively, skipping check",
+			"ocpVersion", ocpVersion,
+		)
+		return &MediaTypeCheckBatchResult{Passed: true}, nil
+	}
+
+	relatedImages = deduplicateImages(relatedImages)
+
+	// wrap an existing context (creates a child context, inherits parents cancellation and adds its own)
+	g, parallelCtx := errgroup.WithContext(ctx)
+	// limit concurrent registry fetches to avoid overwhelming the registry
+	g.SetLimit(goroutinesLimit)
+
+	var wrongMediaTypeImages []string
+	var mu sync.Mutex
+	var brokenImages []string
+	var processed atomic.Int64
+	total := len(relatedImages)
+
+	for _, relatedImage := range relatedImages {
+		g.Go(func() error {
+			result := checkRelatedImageMediaType(
+				parallelCtx, relatedImage, fetcher, ocpVersion)
+			collectResult(result, &mu, &brokenImages, &wrongMediaTypeImages)
+			if count := processed.Add(1); count%1000 == 0 {
+				slog.Info("mediatype check progress", "checked", count, "total", total)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
+	}
+
+	// Retry - check the inaccessible images once again
+	if len(brokenImages) > 0 {
+		slog.Info("retrying broken images fetch", "count", len(brokenImages))
+		retryImages := brokenImages
+		brokenImages = nil // reset
+
+		// new context for the brokenImages retry pass
+		g2, retryCtx := errgroup.WithContext(ctx)
+		g2.SetLimit(max(goroutinesLimit/2, 1))
+
+		for _, relatedImage := range retryImages {
+			g2.Go(func() error {
+				result := checkRelatedImageMediaType(
+					retryCtx, relatedImage, fetcher, ocpVersion)
+				collectResult(result, &mu, &brokenImages, &wrongMediaTypeImages)
+				return nil
+			})
+		}
+		if err := g2.Wait(); err != nil {
+			return nil, err
+		}
+	}
+	if len(wrongMediaTypeImages) > 0 || len(brokenImages) > 0 {
+		return &MediaTypeCheckBatchResult{Passed: false, WrongMediaTypeImages: wrongMediaTypeImages, BrokenImages: brokenImages}, nil
+	}
+
+	return &MediaTypeCheckBatchResult{Passed: true}, nil
+}
+
+// checkRelatedImageMediaType checks a single image's mediaType compatibility. Safe to call from multiple goroutines.
+func checkRelatedImageMediaType(ctx context.Context, relatedImage string, fetcher ManifestFetcher, ocpVersion string) mediaTypeCheckSingleResult {
 	imageMediaTypeDescriptor, err := fetcher.FetchManifest(ctx, relatedImage)
 	if err != nil {
 		slog.Warn(
@@ -49,7 +143,7 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 			"ocpVersion", ocpVersion,
 			"relatedImage", relatedImage,
 		)
-		return MediaTypeCheckResult{
+		return mediaTypeCheckSingleResult{
 			Passed:      false,
 			BrokenImage: relatedImage,
 		}
@@ -60,7 +154,7 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 	// application/vnd.docker.distribution.manifest.v2+json
 	// Docker V2 — compatible, nothing to do
 	case types.DockerManifestSchema2:
-		return MediaTypeCheckResult{Passed: true}
+		return mediaTypeCheckSingleResult{Passed: true}
 
 	// application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json
 	// OCI — incompatible with OCP < 4.21
@@ -71,7 +165,7 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 			"relatedImage", relatedImage,
 			"MediaType", imageMediaTypeDescriptor.MediaType,
 		)
-		return MediaTypeCheckResult{Passed: false, WrongMediaTypeImage: relatedImage}
+		return mediaTypeCheckSingleResult{Passed: false, WrongMediaTypeImage: relatedImage}
 
 	// application/vnd.docker.distribution.manifest.list.v2+json
 	// Multi-arch — need to check each inner manifest
@@ -85,7 +179,7 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 				"relatedImage", relatedImage,
 				"MediaType", imageMediaTypeDescriptor.MediaType,
 			)
-			return MediaTypeCheckResult{Passed: false, BrokenImage: relatedImage}
+			return mediaTypeCheckSingleResult{Passed: false, BrokenImage: relatedImage}
 		}
 		idxManifest, err := idx.IndexManifest()
 		if err != nil {
@@ -96,7 +190,7 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 				"relatedImage", relatedImage,
 				"MediaType", imageMediaTypeDescriptor.MediaType,
 			)
-			return MediaTypeCheckResult{Passed: false, BrokenImage: relatedImage}
+			return mediaTypeCheckSingleResult{Passed: false, BrokenImage: relatedImage}
 		}
 		for _, manifest := range idxManifest.Manifests {
 			if manifest.MediaType != types.DockerManifestSchema2 {
@@ -106,7 +200,7 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 					"relatedImage", relatedImage,
 					"MediaType", manifest.MediaType,
 				)
-				return MediaTypeCheckResult{Passed: false, WrongMediaTypeImage: relatedImage}
+				return mediaTypeCheckSingleResult{Passed: false, WrongMediaTypeImage: relatedImage}
 			}
 		}
 	default:
@@ -115,51 +209,35 @@ func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetche
 			"relatedImage", relatedImage,
 			"MediaType", imageMediaTypeDescriptor.MediaType,
 		)
-		return MediaTypeCheckResult{Passed: false, WrongMediaTypeImage: relatedImage}
+		return mediaTypeCheckSingleResult{Passed: false, WrongMediaTypeImage: relatedImage}
 	}
-	return MediaTypeCheckResult{Passed: true}
+	return mediaTypeCheckSingleResult{Passed: true}
 }
 
-// CheckRelatedImagesMediaType checks whether all related images
-// are compliant with the constraint that OCI MediaType is not present for OCP < v4.21.
-// If the ocp version is >= v4.21, this check is skipped, otherwise we pull the MediaType,
-// check the values, and if there is DockerManifestList we also check its Image manifests
-//
-// Returns (nil, err) if the OCP version is malformed or comparison fails.
-// Returns a MediaTypeCheckResult with Passed=true if all images are compliant or
-// the OCP version >= 4.21. Returns a MediaTypeCheckResult with Passed=false and
-// WrongMediaTypeImages populated for every non-compliant image.
-func CheckRelatedImagesMediaType(
-	ctx context.Context, ocpVersion string, relatedImages []string, fetcher ManifestFetcher,
-) (*MediaTypesCheckResult, error) {
-	// skip the rest of the check if the ocpVersion>=4.21
-	gte, err := ocp.OCPVersionGTE(ocpVersion, ociNativeMinOCPVersion)
-	if err != nil {
-		return nil, err
-	}
-	if gte {
-		slog.Info("ocp version supports OCI media types natively, skipping check",
-			"ocpVersion", ocpVersion,
-		)
-		return &MediaTypesCheckResult{Passed: true}, nil
-	}
-
-	var wrongMediaTypeImages []string
-	var brokenImages []string
-
-	for _, relatedImage := range relatedImages {
-		var result MediaTypeCheckResult = CheckRelatedImageMediaType(
-			ctx, relatedImage, fetcher, ocpVersion)
-		if result.BrokenImage != "" {
-			brokenImages = append(brokenImages, result.BrokenImage)
-		}
-		if result.WrongMediaTypeImage != "" {
-			wrongMediaTypeImages = append(wrongMediaTypeImages, result.WrongMediaTypeImage)
+// deduplicateImages removes duplicate image references while preserving original order.
+func deduplicateImages(images []string) []string {
+	seen := make(map[string]bool, len(images))
+	unique := make([]string, 0, len(images))
+	for _, img := range images {
+		if !seen[img] {
+			seen[img] = true
+			unique = append(unique, img)
 		}
 	}
-	if len(wrongMediaTypeImages) > 0 || len(brokenImages) > 0 {
-		return &MediaTypesCheckResult{Passed: false, WrongMediaTypeImages: wrongMediaTypeImages, BrokenImages: brokenImages}, nil
-	}
+	return unique
+}
 
-	return &MediaTypesCheckResult{Passed: true}, nil
+// collectResult appends a single-image check outcome to the shared result slices under mutex protection.
+func collectResult(result mediaTypeCheckSingleResult, mu *sync.Mutex, brokenImages *[]string, wrongMediaTypeImages *[]string) {
+	switch {
+	case result.BrokenImage != "":
+		mu.Lock()
+		defer mu.Unlock()
+		*brokenImages = append(*brokenImages, result.BrokenImage)
+
+	case result.WrongMediaTypeImage != "":
+		mu.Lock()
+		defer mu.Unlock()
+		*wrongMediaTypeImages = append(*wrongMediaTypeImages, result.WrongMediaTypeImage)
+	}
 }
