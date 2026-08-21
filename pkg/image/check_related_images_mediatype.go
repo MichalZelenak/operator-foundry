@@ -28,10 +28,96 @@ import (
 const ociNativeMinOCPVersion = "4.21"
 
 // MediaTypeCheckResult holds the outcome of the MediaType and OCP version compatibility check
+type MediaTypesCheckResult struct {
+	Passed               bool
+	WrongMediaTypeImages []string
+	BrokenImages         []string
+}
+
 type MediaTypeCheckResult struct {
 	Passed              bool
-	WrongMediaTypeImages []string
-	BrokenImages        []string
+	WrongMediaTypeImage string
+	BrokenImage         string
+}
+
+func CheckRelatedImageMediaType(ctx context.Context, relatedImage string, fetcher ManifestFetcher, ocpVersion string) MediaTypeCheckResult {
+	imageMediaTypeDescriptor, err := fetcher.FetchManifest(ctx, relatedImage)
+	if err != nil {
+		slog.Warn(
+			"failed to fetch media type from related image",
+			"error", err,
+			"ocpVersion", ocpVersion,
+			"relatedImage", relatedImage,
+		)
+		return MediaTypeCheckResult{
+			Passed:      false,
+			BrokenImage: relatedImage,
+		}
+	}
+
+	switch imageMediaTypeDescriptor.MediaType {
+
+	// application/vnd.docker.distribution.manifest.v2+json
+	// Docker V2 — compatible, nothing to do
+	case types.DockerManifestSchema2:
+		return MediaTypeCheckResult{Passed: true}
+
+	// application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json
+	// OCI — incompatible with OCP < 4.21
+	case types.OCIManifestSchema1, types.OCIImageIndex:
+		slog.Warn(
+			"OCI media type is not supported by ocp version < 4.21, rebuild or re-push the image using Docker V2 manifests",
+			"ocpVersion", ocpVersion,
+			"relatedImage", relatedImage,
+			"MediaType", imageMediaTypeDescriptor.MediaType,
+		)
+		return MediaTypeCheckResult{Passed: false, WrongMediaTypeImage: relatedImage}
+
+	// application/vnd.docker.distribution.manifest.list.v2+json
+	// Multi-arch — need to check each inner manifest
+	case types.DockerManifestList:
+		idx, err := imageMediaTypeDescriptor.ImageIndex()
+		if err != nil {
+			slog.Warn(
+				"failed to read manifest list as index image",
+				"error", err,
+				"ocpVersion", ocpVersion,
+				"relatedImage", relatedImage,
+				"MediaType", imageMediaTypeDescriptor.MediaType,
+			)
+			return MediaTypeCheckResult{Passed: false, BrokenImage: relatedImage}
+		}
+		idxManifest, err := idx.IndexManifest()
+		if err != nil {
+			slog.Warn(
+				"failed to parse index manifest",
+				"error", err,
+				"ocpVersion", ocpVersion,
+				"relatedImage", relatedImage,
+				"MediaType", imageMediaTypeDescriptor.MediaType,
+			)
+			return MediaTypeCheckResult{Passed: false, BrokenImage: relatedImage}
+		}
+		for _, manifest := range idxManifest.Manifests {
+			if manifest.MediaType != types.DockerManifestSchema2 {
+				slog.Warn(
+					"inner manifest media type is incompatible with ocp version < 4.21, rebuild or re-push the image using Docker V2 manifests",
+					"ocpVersion", ocpVersion,
+					"relatedImage", relatedImage,
+					"MediaType", manifest.MediaType,
+				)
+				return MediaTypeCheckResult{Passed: false, WrongMediaTypeImage: relatedImage}
+			}
+		}
+	default:
+		slog.Warn("unexpected media type, treating as incompatible",
+			"ocpVersion", ocpVersion,
+			"relatedImage", relatedImage,
+			"MediaType", imageMediaTypeDescriptor.MediaType,
+		)
+		return MediaTypeCheckResult{Passed: false, WrongMediaTypeImage: relatedImage}
+	}
+	return MediaTypeCheckResult{Passed: true}
 }
 
 // CheckRelatedImagesMediaType checks whether all related images
@@ -45,7 +131,7 @@ type MediaTypeCheckResult struct {
 // WrongMediaTypeImages populated for every non-compliant image.
 func CheckRelatedImagesMediaType(
 	ctx context.Context, ocpVersion string, relatedImages []string, fetcher ManifestFetcher,
-) (*MediaTypeCheckResult, error) {
+) (*MediaTypesCheckResult, error) {
 	// skip the rest of the check if the ocpVersion>=4.21
 	gte, err := ocp.OCPVersionGTE(ocpVersion, ociNativeMinOCPVersion)
 	if err != nil {
@@ -55,90 +141,25 @@ func CheckRelatedImagesMediaType(
 		slog.Info("ocp version supports OCI media types natively, skipping check",
 			"ocpVersion", ocpVersion,
 		)
-		return &MediaTypeCheckResult{Passed: true}, nil
+		return &MediaTypesCheckResult{Passed: true}, nil
 	}
 
 	var wrongMediaTypeImages []string
 	var brokenImages []string
 
 	for _, relatedImage := range relatedImages {
-		imageMediaTypeDescriptor, err := fetcher.FetchManifest(ctx, relatedImage)
-		if err != nil {
-			slog.Warn(
-				"failed to fetch media type from related image",
-				"error", err,
-				"relatedImage", relatedImage,
-			)
-			brokenImages = append(brokenImages, relatedImage)
-			// continue with the rest of relatedImages, so the user is aware of all the issues
-			continue
+		var result MediaTypeCheckResult = CheckRelatedImageMediaType(
+			ctx, relatedImage, fetcher, ocpVersion)
+		if result.BrokenImage != "" {
+			brokenImages = append(brokenImages, result.BrokenImage)
 		}
-
-		switch imageMediaTypeDescriptor.MediaType {
-
-		// application/vnd.docker.distribution.manifest.v2+json
-		// Docker V2 — compatible, nothing to do
-		case types.DockerManifestSchema2:
-			continue
-
-		// application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json
-		// OCI — incompatible with OCP < 4.21
-		case types.OCIManifestSchema1, types.OCIImageIndex:
-			slog.Warn(
-				"OCI media type is not supported by ocp version < 4.21, rebuild or re-push the image using Docker V2 manifests",
-				"ocpVersion", ocpVersion,
-				"relatedImage", relatedImage,
-				"MediaType", imageMediaTypeDescriptor.MediaType,
-			)
-			wrongMediaTypeImages = append(wrongMediaTypeImages, relatedImage)
-			continue
-
-		// application/vnd.docker.distribution.manifest.list.v2+json
-		// Multi-arch — need to check each inner manifest
-		case types.DockerManifestList:
-			idx, err := imageMediaTypeDescriptor.ImageIndex()
-			if err != nil {
-				slog.Warn(
-					"failed to read manifest list as index image",
-					"error", err, "relatedImage", relatedImage,
-				)
-				brokenImages = append(brokenImages, relatedImage)
-				continue
-			}
-			idxManifest, err := idx.IndexManifest()
-			if err != nil {
-				slog.Warn(
-					"failed to parse index manifest",
-					"error", err, "relatedImage", relatedImage,
-				)
-				brokenImages = append(brokenImages, relatedImage)
-				continue
-			}
-			for _, manifest := range idxManifest.Manifests {
-				if manifest.MediaType != types.DockerManifestSchema2 {
-					slog.Warn(
-						"inner manifest media type is incompatible with ocp version < 4.21, rebuild or re-push the image using Docker V2 manifests",
-						"ocpVersion", ocpVersion,
-						"relatedImage", relatedImage,
-						"MediaType", manifest.MediaType,
-					)
-					wrongMediaTypeImages = append(wrongMediaTypeImages, relatedImage)
-					break
-				}
-			}
-		default:
-			slog.Warn("unexpected media type, treating as incompatible",
-				"relatedImage", relatedImage,
-				"MediaType", imageMediaTypeDescriptor.MediaType,
-			)
-			wrongMediaTypeImages = append(wrongMediaTypeImages, relatedImage)
-			continue
+		if result.WrongMediaTypeImage != "" {
+			wrongMediaTypeImages = append(wrongMediaTypeImages, result.WrongMediaTypeImage)
 		}
-
 	}
 	if len(wrongMediaTypeImages) > 0 || len(brokenImages) > 0 {
-		return &MediaTypeCheckResult{Passed: false, WrongMediaTypeImages: wrongMediaTypeImages, BrokenImages: brokenImages}, nil
+		return &MediaTypesCheckResult{Passed: false, WrongMediaTypeImages: wrongMediaTypeImages, BrokenImages: brokenImages}, nil
 	}
 
-	return &MediaTypeCheckResult{Passed: true}, nil
+	return &MediaTypesCheckResult{Passed: true}, nil
 }
